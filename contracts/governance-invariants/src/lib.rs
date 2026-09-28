@@ -572,6 +572,79 @@ impl GovernanceInvariantsContract {
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
+
+    /// Compute the dynamic flash loan fee for a caller based on their $veFLOW$ governance lock balance.
+    /// Formula: $f_{flash} = f_{base} 	imes \left(1.0 - \min\left(0.5, rac{W_{ve}}{W_{max}}ight)ight)$
+    /// Parameters:
+    /// - `caller`: The address invoking the flash loan.
+    /// - `base_fee`: The base fee amount (scaled by 10^7 or similar fixed-point base, e.g. basis points).
+    /// - `w_max`: The maximum governance lock weight required for the maximum 50% discount.
+    pub fn calculate_flash_loan_fee(
+        env: Env,
+        caller: Address,
+        base_fee: i128,
+        w_max: i128,
+    ) -> Result<i128, InvariantError> {
+        if w_max <= 0 || base_fee < 0 {
+            return Err(InvariantError::InvalidAmount);
+}
+
+        let w_ve = Self::get_voting_power(env, caller, 0);
+        if w_ve < 0 {
+            return Err(InvariantError::Overflow);
+        }
+
+        // Calculate discount factor scaled by 10000 (representing basis points / percentage precision)
+        // W_ve / W_max capped at 0.5 (5000 in basis points)
+        let ratio = w_ve
+            .checked_mul(10000)
+            .ok_or(InvariantError::Overflow)?;
+        let mut discount_bp = ratio / w_max;
+        if discount_bp > 5000 {
+            discount_bp = 5000;
+        }
+        if discount_bp < 0 {
+            discount_bp = 0;
+        }
+
+        // fee = base_fee * (10000 - discount_bp) / 10000
+        let multiplier = 10000 - discount_bp;
+        let fee = base_fee
+            .checked_mul(multiplier)
+            .ok_or(InvariantError::Overflow)?
+            / 10000;
+
+        Ok(fee)
+    }
+
+    /// Invoke a flash loan by verifying caller authorization, checking governance lock balance $W_{ve}$,
+    /// and computing the dynamic discounted flash loan fee.
+    pub fn invoke_flash_loan(
+        env: Env,
+        caller: Address,
+        borrow_amount: i128,
+        base_fee: i128,
+        w_max: i128,
+    ) -> Result<i128, InvariantError> {
+        caller.require_auth();
+
+        if borrow_amount <= 0 || base_fee < 0 || w_max <= 0 {
+            return Err(InvariantError::InvalidAmount);
+        }
+
+        // Check caller governance lock balance W_ve during flash loan invocation
+        let _w_ve = Self::get_voting_power(env.clone(), caller.clone(), 0);
+
+        // Compute the dynamic flash loan fee incorporating the veFLOW discount
+        let fee = Self::calculate_flash_loan_fee(env.clone(), caller.clone(), base_fee, w_max)?;
+
+        env.events().publish(
+            (symbol_short!("flash_ln"),),
+            (caller, borrow_amount, fee),
+        );
+
+        Ok(fee)
+    }
 }
 
 #[cfg(test)]
@@ -884,5 +957,47 @@ mod tests {
         // Now delegation is revoked: A gets its 1000 power back, B's power is 0
         assert_eq!(client.get_voting_power(&user_a, &0), 1000);
         assert_eq!(client.get_voting_power(&user_b, &0), 0);
+    }
+
+    #[test]
+    fn test_flash_loan_fee_tiers_and_invariants() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let user_zero = Address::generate(&env);
+        let user_half = Address::generate(&env);
+        let user_max = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        // user_zero has no lock (W_ve = 0)
+        // user_half locks 500 (W_ve = 500, with w_max = 1000 -> ratio = 0.5 -> 50% discount)
+        client.lock_tokens(&user_half, &500);
+        // user_max locks 2000 (W_ve = 2000, with w_max = 1000 -> ratio = 2.0 -> capped at 50% discount)
+        client.lock_tokens(&user_max, &2000);
+
+        let base_fee = 1000i128;
+        let w_max = 1000i128;
+
+        // Tier 1: Zero balance -> 0% discount -> fee = base_fee (1000)
+        let fee_zero = client.calculate_flash_loan_fee(&user_zero, &base_fee, &w_max);
+        assert_eq!(fee_zero, 1000);
+
+        // Tier 2: Partial balance (50% of w_max) -> 25% discount -> fee = 750
+        let user_quarter = Address::generate(&env);
+        client.lock_tokens(&user_quarter, &250);
+        let fee_quarter = client.calculate_flash_loan_fee(&user_quarter, &base_fee, &w_max);
+        assert_eq!(fee_quarter, 750);
+
+        // Tier 3: Exactly max discount threshold (50% of w_max) -> 50% discount -> fee = 500
+        let fee_half = client.calculate_flash_loan_fee(&user_half, &base_fee, &w_max);
+        assert_eq!(fee_half, 500);
+
+        // Tier 4: Exceeds max discount threshold (200% of w_max) -> capped at 50% discount -> fee = 500
+        let fee_max = client.calculate_flash_loan_fee(&user_max, &base_fee, &w_max);
+        assert_eq!(fee_max, 500);
+
+        // Verify flash loan invocation checks balance and applies fee correctly
+        let invoked_fee = client.invoke_flash_loan(&user_half, &10000i128, &base_fee, &w_max);
+        assert_eq!(invoked_fee, 500);
     }
 }
