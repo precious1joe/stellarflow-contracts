@@ -104,6 +104,52 @@ impl GovernanceExecuterContract {
             .get(&DataKey::Proposal(proposal_id))
             .expect("proposal not found")
     }
+
+    /// Execute multiple queued governance proposals in a single atomic transaction post-timelock.
+    /// Verifies all proposal timelocks satisfy current_time >= timelock_until,
+    /// executes calls sequentially in order of proposal submission, and reverts the whole batch if any fails.
+    pub fn execute_batch(env: Env, proposal_ids: Vec<u64>) -> Vec<soroban_sdk::Val> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let current_time = env.ledger().timestamp();
+
+        // First pass: load and verify all proposals exist, are not already executed, and satisfy timelock
+        let mut proposals = Vec::new(&env);
+        for i in 0..proposal_ids.len() {
+            let id = proposal_ids.get(i).unwrap();
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(id))
+                .expect("proposal not found");
+
+            if proposal.executed {
+                panic!("proposal already executed");
+            }
+            if current_time < proposal.timelock_until {
+                panic!("timelock period has not expired");
+            }
+            proposals.push_back(proposal);
+        }
+
+        // Second pass: mark all as executed and dispatch calls sequentially
+        let mut results = Vec::new(&env);
+        for i in 0..proposals.len() {
+            let mut proposal = proposals.get(i).unwrap();
+            proposal.executed = true;
+            env.storage().persistent().set(&DataKey::Proposal(proposal.id), &proposal);
+
+            let res = env.invoke_contract(
+                &proposal.target,
+                &proposal.function,
+                proposal.payload,
+            );
+            results.push_back(res);
+        }
+
+        results
+    }
 }
 
 mod test;
