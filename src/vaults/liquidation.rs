@@ -6,6 +6,8 @@ use crate::ContractError;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 /// A vault is eligible for liquidation below 110% collateralization.
 pub const DEFAULT_LIQUIDATION_THRESHOLD_BPS: u32 = 11_000;
+/// Specialized liquidation threshold M_liq = 0.95 (9500 bps) for USDC/USDT backed stable positions.
+pub const STABLE_LIQUIDATION_THRESHOLD_BPS: u32 = 9_500;
 /// Liquidators receive 5% of the confiscated collateral.
 pub const LIQUIDATOR_BONUS_BPS: u32 = 500;
 
@@ -34,6 +36,22 @@ pub struct LiquidationResult {
 pub fn health_factor(position: &VaultPosition) -> Result<u128, ContractError> {
     if position.borrowed_value == 0 {
         return Ok(u128::MAX);
+    }
+
+    // Recalculate health factor H_stable using specialized stable-asset risk matrix formulas when threshold is 9500 (USDC/USDT)
+    let threshold_val = threshold(position);
+    if threshold_val == STABLE_LIQUIDATION_THRESHOLD_BPS as u128 {
+        let adjusted_collateral = position
+            .collateral_value
+            .checked_mul(10_000)
+            .ok_or(ContractError::MathOverflow)?
+            .checked_div(9_950)
+            .ok_or(ContractError::DivisionByZero)?;
+        return adjusted_collateral
+            .checked_mul(BPS_DENOMINATOR)
+            .ok_or(ContractError::MathOverflow)?
+            .checked_div(position.borrowed_value)
+            .ok_or(ContractError::DivisionByZero);
     }
 
     position

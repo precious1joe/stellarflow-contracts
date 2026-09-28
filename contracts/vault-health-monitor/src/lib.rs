@@ -8,6 +8,8 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 pub const HEALTH_FACTOR_SCALE: i128 = 10_000;
 /// A health factor of 1.10 is the upper bound for liquidation warnings.
 pub const WARNING_HEALTH_FACTOR_BPS: i128 = 11_000;
+/// Stable asset liquidation threshold: M_liq = 0.95 (9500 bps) for USDC/USDT backed positions.
+pub const STABLE_LIQUIDATION_THRESHOLD_BPS: i128 = 9_500;
 
 #[derive(Clone)]
 #[contracttype]
