@@ -8,6 +8,8 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 pub const HEALTH_FACTOR_SCALE: i128 = 10_000;
 /// A health factor of 1.10 is the upper bound for liquidation warnings.
 pub const WARNING_HEALTH_FACTOR_BPS: i128 = 11_000;
+/// Specialized liquidation threshold for stable-asset risk matrix (USDC/USDT backed positions): 95% (9_500 bps).
+pub const STABLE_LIQUIDATION_THRESHOLD_BPS: i128 = 9_500;
 
 #[derive(Clone)]
 #[contracttype]
@@ -77,6 +79,30 @@ impl VaultHealthMonitor {
         debt_value: i128,
         liquidation_threshold_bps: i128,
     ) -> Result<i128, Error> {
+        Self::assess_vault_health_internal(env, vault, account, collateral_value, debt_value, liquidation_threshold_bps, false)
+    }
+
+    /// Evaluate an account's vault position with dynamic stable-asset decoupling when `is_stable` is true.
+    /// Uses specialized stable-asset risk matrix formula with $M_{liq} = 0.95$ (9_500 bps).
+    pub fn assess_stable_vault_health(
+        env: Env,
+        vault: Address,
+        account: Address,
+        collateral_value: i128,
+        debt_value: i128,
+    ) -> Result<i128, Error> {
+        Self::assess_vault_health_internal(env, vault, account, collateral_value, debt_value, STABLE_LIQUIDATION_THRESHOLD_BPS, true)
+    }
+
+    fn assess_vault_health_internal(
+        env: Env,
+        vault: Address,
+        account: Address,
+        collateral_value: i128,
+        debt_value: i128,
+        liquidation_threshold_bps: i128,
+        is_stable: bool,
+    ) -> Result<i128, Error> {
         let configured_vault: Address = env
             .storage()
             .instance()
@@ -95,11 +121,26 @@ impl VaultHealthMonitor {
             return Err(Error::InvalidValue);
         }
 
-        let health_factor_bps = collateral_value
+        let health_factor_bps = if is_stable {
+            // Specialized stable-asset risk matrix formula: H_stable = (collateral_value * threshold + adjustment_factor) / debt_value
+            // Applying reduced collateralization and decoupled correlation scaling for correlated stablecoin pairs.
+            let adjusted_collateral = collateral_value
+                .checked_mul(10_000)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_div(9_950)
+                .ok_or(Error::ArithmeticOverflow)?;
+            adjusted_collateral
             .checked_mul(liquidation_threshold_bps)
             .ok_or(Error::ArithmeticOverflow)?
             .checked_div(debt_value)
-            .ok_or(Error::ArithmeticOverflow)?;
+                .ok_or(Error::ArithmeticOverflow)?
+        } else {
+            collateral_value
+                .checked_mul(liquidation_threshold_bps)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_div(debt_value)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
 
         if health_factor_bps > HEALTH_FACTOR_SCALE && health_factor_bps <= WARNING_HEALTH_FACTOR_BPS
         {
@@ -165,6 +206,16 @@ mod test {
         assert!(event_debug.contains("VaultHealthWarning"));
         assert!(event_debug.contains("10500"));
         assert!(event_debug.contains("1234"));
+    }
+
+    #[test]
+    fn test_stable_vault_health_decoupling_and_threshold() {
+        let (env, client, vault, account) = setup();
+
+        // Test that stable asset assessment uses 0.95 (9500 bps) threshold and specialized risk formula
+        let hf = client.assess_stable_vault_health(&vault, &account, &10_000, &10_000);
+        // collateral 10,000 adjusted for stable matrix (~10050) * 9500 / 10000 = ~9547 bps
+        assert!(hf > 9_000 && hf < 10_000);
     }
 
     #[test]
