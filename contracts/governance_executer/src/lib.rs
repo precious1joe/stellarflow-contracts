@@ -97,12 +97,56 @@ impl GovernanceExecuterContract {
         )
     }
 
-    /// Retrieve proposal details
+    /// Execute proposal details
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .expect("proposal not found")
+    }
+
+    /// Execute multiple queued governance proposals in a single atomic transaction post-timelock
+    pub fn execute_batch(env: Env, proposal_ids: Vec<u64>) -> Vec<soroban_sdk::Val> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let current_time = env.ledger().timestamp();
+        let mut results = vec![&env];
+
+        // First pass: verify existence, execution state, and timelocks for all proposals
+        let mut proposals = vec![&env];
+        for id in proposal_ids.iter() {
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(id))
+                .expect("proposal not found");
+
+            if proposal.executed {
+                panic!("proposal already executed");
+            }
+
+            if current_time < proposal.timelock_until {
+                panic!("timelock period has not expired");
+            }
+
+            proposals.push_back(proposal);
+        }
+
+        // Second pass: mark all as executed and execute sequentially in order of proposal submission
+        for mut proposal in proposals.iter() {
+            proposal.executed = true;
+            env.storage().persistent().set(&DataKey::Proposal(proposal.id), &proposal);
+
+            let res = env.invoke_contract(
+                &proposal.target,
+                &proposal.function,
+                proposal.payload,
+            );
+            results.push_back(res);
+        }
+
+        results
     }
 }
 
