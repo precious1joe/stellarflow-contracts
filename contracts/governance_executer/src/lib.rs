@@ -104,6 +104,48 @@ impl GovernanceExecuterContract {
             .get(&DataKey::Proposal(proposal_id))
             .expect("proposal not found")
     }
+
+    /// Execute multiple queued governance proposals in a single atomic transaction post-timelock
+    pub fn execute_batch(env: Env, proposal_ids: Vec<u64>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let current_time = env.ledger().timestamp();
+
+        // First pass: Verify all proposal timelocks satisfy t_current >= t_approved + T_delay
+        // and ensure none are already executed, collecting them in order.
+        let mut proposals = Vec::new(&env);
+        for id in proposal_ids.iter() {
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(id))
+                .expect("proposal not found");
+
+            if proposal.executed {
+                panic!("proposal already executed");
+            }
+
+            if current_time < proposal.timelock_until {
+                panic!("timelock period has not expired");
+            }
+
+            proposals.push_back(proposal);
+        }
+
+        // Second pass: Mark all proposals as executed and invoke calls sequentially in order of submission.
+        // Soroban transactions are atomic; any panic in invoke_contract will revert the entire batch.
+        for mut proposal in proposals.iter() {
+            proposal.executed = true;
+            env.storage().persistent().set(&DataKey::Proposal(proposal.id), &proposal);
+
+            env.invoke_contract(
+                &proposal.target,
+                &proposal.function,
+                proposal.payload,
+            );
+        }
+    }
 }
 
 mod test;
