@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
 };
 
+
 /// Errors emitted when invariant checks fail.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -886,3 +887,4 @@ mod tests {
         assert_eq!(client.get_voting_power(&user_b, &0), 0);
     }
 }
+
