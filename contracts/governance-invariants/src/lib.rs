@@ -484,6 +484,47 @@ impl GovernanceInvariantsContract {
         Ok(())
     }
 
+    /// Compute the dynamic flash loan fee for a caller based on their $veFLOW$ balance $W_{ve}$.
+    /// Formula: f_flash = f_base * (1.0 - min(0.5, W_ve / W_max))
+    /// Parameters are represented in scaled integer math (e.g. basis points where 10000 = 100%).
+    /// W_ve: user voting weight / lock balance
+    /// W_max: maximum cap for max discount (50%)
+    /// base_fee_bps: base flash loan fee in basis points (e.g. 30 for 0.3%)
+    pub fn calculate_flash_loan_fee(env: Env, caller: Address, base_fee_bps: u32, w_max: i128) -> Result<u32, InvariantError> {
+        if w_max <= 0 {
+            return Err(InvariantError::InvalidAmount);
+        }
+        let w_ve = Self::get_voting_power(env, caller, 0);
+        let w_ve_clamped = if w_ve < 0 { 0 } else { w_ve };
+        
+        // Calculate ratio W_ve / W_max scaled by 1_000_000 for precision
+        let ratio_scaled = (w_ve_clamped as u128) 
+            .checked_mul(1_000_000)
+            .ok_or(InvariantError::Overflow)?
+            .checked_div(w_max as u128)
+            .unwrap_or(0);
+            
+        // Max discount is 50% (500_000 scaled)
+        let max_discount_scaled = 500_000u128;
+        let discount_scaled = if ratio_scaled > max_discount_scaled {
+            max_discount_scaled
+        } else {
+            ratio_scaled
+        };
+        
+        // Remaining fee factor: (1.0 - discount) scaled by 1_000_000
+        let fee_factor_scaled = 1_000_000u128 - discount_scaled;
+        
+        // f_flash = base_fee_bps * fee_factor_scaled / 1_000_000
+        let final_fee = (base_fee_bps as u128)
+            .checked_mul(fee_factor_scaled)
+            .ok_or(InvariantError::Overflow)?
+            .checked_div(1_000_000)
+            .ok_or(InvariantError::Overflow)?;
+            
+        Ok(final_fee as u32)
+    }
+
     /// Get the stored total voting weight.
     pub fn get_total_voting_weight(env: Env) -> i128 {
         env.storage()
