@@ -6,6 +6,8 @@ use crate::ContractError;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 /// A vault is eligible for liquidation below 110% collateralization.
 pub const DEFAULT_LIQUIDATION_THRESHOLD_BPS: u32 = 11_000;
+/// Set higher liquidation threshold M_liq = 0.95 (9500 bps) for USDC/USDT backed positions.
+pub const STABLE_LIQUIDATION_THRESHOLD_BPS: u32 = 9_500;
 /// Liquidators receive 5% of the confiscated collateral.
 pub const LIQUIDATOR_BONUS_BPS: u32 = 500;
 
@@ -32,16 +34,36 @@ pub struct LiquidationResult {
 }
 
 pub fn health_factor(position: &VaultPosition) -> Result<u128, ContractError> {
+    health_factor_extended(position, false, false)
+}
+
+pub fn health_factor_extended(position: &VaultPosition, is_collateral_stable: bool, is_debt_stable: bool) -> Result<u128, ContractError> {
     if position.borrowed_value == 0 {
         return Ok(u128::MAX);
     }
 
-    position
+    let threshold_val = if is_collateral_stable && is_debt_stable {
+        STABLE_LIQUIDATION_THRESHOLD_BPS as u128
+    } else {
+        BPS_DENOMINATOR
+    };
+
+    let base_hf = position
         .collateral_value
         .checked_mul(BPS_DENOMINATOR)
         .ok_or(ContractError::MathOverflow)?
         .checked_div(position.borrowed_value)
+        .ok_or(ContractError::DivisionByZero)?;
+
+    if is_collateral_stable && is_debt_stable {
+        base_hf
+            .checked_mul(threshold_val)
+            .ok_or(ContractError::MathOverflow)?
+            .checked_div(BPS_DENOMINATOR)
         .ok_or(ContractError::DivisionByZero)
+    } else {
+        Ok(base_hf)
+    }
 }
 
 fn threshold(position: &VaultPosition) -> u128 {

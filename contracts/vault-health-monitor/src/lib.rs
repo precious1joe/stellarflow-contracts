@@ -8,6 +8,8 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 pub const HEALTH_FACTOR_SCALE: i128 = 10_000;
 /// A health factor of 1.10 is the upper bound for liquidation warnings.
 pub const WARNING_HEALTH_FACTOR_BPS: i128 = 11_000;
+/// Higher liquidation threshold M_liq = 0.95 (9500 bps) for stable assets (e.g. USDC/USDT).
+pub const STABLE_LIQUIDATION_THRESHOLD_BPS: i128 = 9_500;
 
 #[derive(Clone)]
 #[contracttype]
@@ -77,6 +79,20 @@ impl VaultHealthMonitor {
         debt_value: i128,
         liquidation_threshold_bps: i128,
     ) -> Result<i128, Error> {
+        Self::assess_vault_health_stable(env, vault, account, collateral_value, debt_value, liquidation_threshold_bps, false, false)
+    }
+
+    /// Evaluate vault health with specialized stable-asset risk matrix decoupling for USDC/USDT backed positions.
+    pub fn assess_vault_health_stable(
+        env: Env,
+        vault: Address,
+        account: Address,
+        collateral_value: i128,
+        debt_value: i128,
+        liquidation_threshold_bps: i128,
+        is_collateral_stable: bool,
+        is_debt_stable: bool,
+    ) -> Result<i128, Error> {
         let configured_vault: Address = env
             .storage()
             .instance()
@@ -95,11 +111,31 @@ impl VaultHealthMonitor {
             return Err(Error::InvalidValue);
         }
 
-        let health_factor_bps = collateral_value
-            .checked_mul(liquidation_threshold_bps)
+        let effective_threshold = if is_collateral_stable && is_debt_stable {
+            STABLE_LIQUIDATION_THRESHOLD_BPS
+        } else {
+            liquidation_threshold_bps
+        };
+
+        let health_factor_bps = if is_collateral_stable && is_debt_stable {
+            // Specialized stable-asset risk matrix formula for correlated stablecoin pairs
+            let adjusted_collateral = collateral_value
+                .checked_mul(9990)
             .ok_or(Error::ArithmeticOverflow)?
-            .checked_div(debt_value)
+                .checked_div(10000)
             .ok_or(Error::ArithmeticOverflow)?;
+            adjusted_collateral
+                .checked_mul(effective_threshold)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_div(debt_value)
+                .ok_or(Error::ArithmeticOverflow)?
+        } else {
+            collateral_value
+                .checked_mul(effective_threshold)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_div(debt_value)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
 
         if health_factor_bps > HEALTH_FACTOR_SCALE && health_factor_bps <= WARNING_HEALTH_FACTOR_BPS
         {
@@ -107,7 +143,7 @@ impl VaultHealthMonitor {
                 vault,
                 account: account.clone(),
                 health_factor_bps,
-                liquidation_threshold_bps,
+                liquidation_threshold_bps: if is_collateral_stable && is_debt_stable { STABLE_LIQUIDATION_THRESHOLD_BPS } else { liquidation_threshold_bps },
                 collateral_value,
                 debt_value,
                 timestamp: env.ledger().timestamp(),
